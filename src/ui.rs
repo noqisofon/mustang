@@ -4,6 +4,7 @@ use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetFor
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, QueueableCommand};
 
+use crate::decoration;
 use crate::editor::Editor;
 use crate::keymap::PrefixState;
 use crate::util;
@@ -63,6 +64,15 @@ fn draw_ruler<W: Write>(out: &mut W, editor: &Editor, cols: usize) -> io::Result
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RenderState {
+    reverse: bool,
+    bold: bool,
+    italic: bool,
+    dim: bool,
+    color: Option<Color>,
+}
+
 fn draw_text<W: Write>(out: &mut W, editor: &Editor, text_rows: usize, cols: usize) -> io::Result<()> {
     let marks = if editor.block_visible {
         editor.normalized_marks()
@@ -79,9 +89,16 @@ fn draw_text<W: Write>(out: &mut W, editor: &Editor, text_rows: usize, cols: usi
             continue;
         }
         let chars = &editor.buffer.lines[line_idx];
+        let styles = if editor.config.display.decoration {
+            decoration::parse_line_styles(chars, &decoration::PANDOC_MARKDOWN)
+        } else {
+            Vec::new()
+        };
+
         let mut col = 0usize;
         let mut printed = 0usize;
-        let mut in_highlight = false;
+        let mut current_state = RenderState::default();
+
         for (ci, &ch) in chars.iter().enumerate() {
             if printed >= cols {
                 break;
@@ -93,13 +110,53 @@ fn draw_text<W: Write>(out: &mut W, editor: &Editor, text_rows: usize, cols: usi
                     let pos = (line_idx, ci);
                     pos >= s && pos < e
                 });
-                if is_marked && !in_highlight {
-                    out.queue(SetAttribute(Attribute::Reverse))?;
-                    in_highlight = true;
-                } else if !is_marked && in_highlight {
-                    out.queue(SetAttribute(Attribute::Reset))?;
-                    in_highlight = false;
+
+                let style = styles.get(ci).copied().unwrap_or_default();
+
+                let mut target_state = RenderState {
+                    reverse: is_marked,
+                    ..Default::default()
+                };
+
+                if style.is_marker {
+                    target_state.dim = true;
+                    target_state.color = Some(Color::DarkGrey);
+                } else {
+                    if style.bold {
+                        target_state.bold = true;
+                    }
+                    if style.italic {
+                        if editor.config.display.italic_fallback {
+                            target_state.color = Some(Color::Cyan);
+                        } else {
+                            target_state.italic = true;
+                        }
+                    }
                 }
+
+                if target_state != current_state {
+                    if current_state != RenderState::default() {
+                        out.queue(SetAttribute(Attribute::Reset))?;
+                        out.queue(ResetColor)?;
+                    }
+                    if target_state.reverse {
+                        out.queue(SetAttribute(Attribute::Reverse))?;
+                    }
+                    if target_state.bold {
+                        out.queue(SetAttribute(Attribute::Bold))?;
+                    }
+                    if target_state.italic {
+                        out.queue(SetAttribute(Attribute::Italic))?;
+                    }
+                    if target_state.dim {
+                        out.queue(SetAttribute(Attribute::Dim))?;
+                    }
+                    if let Some(c) = target_state.color {
+                        out.queue(SetForegroundColor(c))?;
+                    }
+                    current_state = target_state;
+                }
+
                 if ch == '\t' {
                     let n = w.min(cols - printed);
                     out.queue(Print(" ".repeat(n)))?;
@@ -111,8 +168,10 @@ fn draw_text<W: Write>(out: &mut W, editor: &Editor, text_rows: usize, cols: usi
             }
             col += w;
         }
-        if in_highlight {
+
+        if current_state != RenderState::default() {
             out.queue(SetAttribute(Attribute::Reset))?;
+            out.queue(ResetColor)?;
         }
     }
     Ok(())
@@ -130,11 +189,20 @@ fn draw_menu<W: Write>(out: &mut W, editor: &Editor, row_start: u16, cols: usize
             "^Q R=doc start   C=doc end   F=find   A=find&replace   Y=del to EOL",
             "^Q B=goto block begin  K=goto block end  L=goto line   Esc=cancel",
         ],
-        PrefixState::O => ["^O H=hide/show this key menu", "", "                 Esc=cancel"],
+        PrefixState::O => [
+            "^O H=hide/show key menu   D=toggle decoration display",
+            "",
+            "                                                      Esc=cancel",
+        ],
+        PrefixState::P => [
+            "^P B=bold (**text**)   Y=italic (*text*)",
+            "",
+            "                                                      Esc=cancel",
+        ],
         PrefixState::None => [
             "^E up  ^X down  ^S left  ^D right   ^A word-left  ^F word-right  ^R/^C page up/down",
             "^G del-char  ^H bksp  ^T del-word  ^Y del-line  ^N open-line  ^V ins/ovr  Tab",
-            "^K block/file menu   ^Q quick-move/find menu   ^L repeat find   ^J/F1 help",
+            "^K block/file  ^Q quick/find  ^P decor  ^O options  ^L rep-find  ^J/F1 help",
         ],
     };
     for (i, text) in lines.iter().enumerate() {
@@ -211,6 +279,9 @@ fn draw_help_overlay<W: Write>(out: &mut W, cols: usize, rows: usize) -> io::Res
         "         ^K C copy block   ^K V move block   ^K Y delete block",
         "         ^K H hide/show    ^K W write to file   ^K R read file in",
         "         ^Q B goto block begin     ^Q K goto block end",
+        "",
+        "Decor:   ^P B bold (**text**)    ^P Y italic (*text*)",
+        "         ^O D toggle decoration display",
         "",
         "Search:  ^Q F find    ^Q A find & replace    ^L repeat find",
         "",

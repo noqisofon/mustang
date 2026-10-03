@@ -1,4 +1,6 @@
 mod buffer;
+mod config;
+mod decoration;
 mod editor;
 mod keymap;
 mod ui;
