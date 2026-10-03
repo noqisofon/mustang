@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::buffer::{self, Buffer};
+use crate::config::Config;
+use crate::decoration::{self, DecorationKind};
 use crate::keymap::{self, Command, PrefixState};
 use crate::util::{self, TAB_SIZE};
 
@@ -59,6 +61,7 @@ pub struct Editor {
     pub prompt_label: String,
     pub text_rows: usize,
     pub text_cols: usize,
+    pub config: Config,
 
     pending_replace_search: Option<String>,
     last_search: Option<String>,
@@ -68,6 +71,10 @@ pub struct Editor {
 
 impl Editor {
     pub fn new(buffer: Buffer) -> Self {
+        Self::with_config(buffer, Config::load())
+    }
+
+    pub fn with_config(buffer: Buffer, config: Config) -> Self {
         Editor {
             buffer,
             cur_line: 0,
@@ -88,6 +95,7 @@ impl Editor {
             prompt_label: String::new(),
             text_rows: 1,
             text_cols: 1,
+            config,
             pending_replace_search: None,
             last_search: None,
             last_match_end: None,
@@ -215,6 +223,10 @@ impl Editor {
 
             Command::ToggleMenu => self.menu_visible = !self.menu_visible,
             Command::Help => self.help_visible = true,
+
+            Command::ToggleBold => self.toggle_decoration(DecorationKind::Bold),
+            Command::ToggleItalic => self.toggle_decoration(DecorationKind::Italic),
+            Command::ToggleDecorationDisplay => self.toggle_decoration_display(),
         }
         self.clamp_cursor();
     }
@@ -513,6 +525,136 @@ impl Editor {
         self.cur_col = s.1;
         self.clear_mark();
         self.message = "Block deleted".to_string();
+    }
+
+    // ---- decoration operations ----------------------------------------
+
+    pub fn toggle_decoration(&mut self, kind: DecorationKind) {
+        let syntax = &decoration::PANDOC_MARKDOWN;
+        let marker = syntax.marker_for(kind);
+        let marker_chars: Vec<char> = marker.chars().collect();
+        let m_len = marker_chars.len();
+
+        let has_selection = self.block_visible && self.normalized_marks().is_some_and(|(s, e)| s < e);
+
+        if has_selection {
+            let (s, e) = self.normalized_marks().unwrap();
+            // Subcase 1A: Selected text on single line begins and ends with the marker
+            if s.0 == e.0 && (e.1 - s.1) >= 2 * m_len {
+                let line = &self.buffer.lines[s.0];
+                if line[s.1..s.1 + m_len] == marker_chars[..]
+                    && line[e.1 - m_len..e.1] == marker_chars[..]
+                {
+                    self.buffer.delete_range((s.0, e.1 - m_len), (s.0, e.1));
+                    self.buffer.delete_range((s.0, s.1), (s.0, s.1 + m_len));
+                    self.mark_start = Some(s);
+                    self.mark_end = Some((e.0, e.1 - 2 * m_len));
+                    if self.cur_line == s.0 {
+                        if self.cur_col >= e.1 - m_len {
+                            self.cur_col = self.cur_col.saturating_sub(2 * m_len);
+                        } else if self.cur_col >= s.1 + m_len {
+                            self.cur_col = self.cur_col.saturating_sub(m_len);
+                        } else if self.cur_col >= s.1 {
+                            self.cur_col = s.1;
+                        }
+                    }
+                    self.clamp_cursor();
+                    return;
+                }
+            }
+
+            // Subcase 1B: Text immediately surrounding the selection is the marker
+            if s.0 == e.0 {
+                let line = &self.buffer.lines[s.0];
+                if s.1 >= m_len
+                    && e.1 + m_len <= line.len()
+                    && line[s.1 - m_len..s.1] == marker_chars[..]
+                    && line[e.1..e.1 + m_len] == marker_chars[..]
+                {
+                    self.buffer.delete_range((s.0, e.1), (s.0, e.1 + m_len));
+                    self.buffer.delete_range((s.0, s.1 - m_len), (s.0, s.1));
+                    self.mark_start = Some((s.0, s.1 - m_len));
+                    self.mark_end = Some((e.0, e.1 - m_len));
+                    if self.cur_line == s.0 && self.cur_col >= s.1 {
+                        self.cur_col = self.cur_col.saturating_sub(m_len);
+                    }
+                    self.clamp_cursor();
+                    return;
+                }
+            } else {
+                let s_line = &self.buffer.lines[s.0];
+                let e_line = &self.buffer.lines[e.0];
+                if s.1 >= m_len
+                    && e.1 + m_len <= e_line.len()
+                    && s_line[s.1 - m_len..s.1] == marker_chars[..]
+                    && e_line[e.1..e.1 + m_len] == marker_chars[..]
+                {
+                    self.buffer.delete_range((e.0, e.1), (e.0, e.1 + m_len));
+                    self.buffer.delete_range((s.0, s.1 - m_len), (s.0, s.1));
+                    self.mark_start = Some((s.0, s.1 - m_len));
+                    self.mark_end = Some((e.0, e.1));
+                    self.clamp_cursor();
+                    return;
+                }
+            }
+
+            // Subcase 1C: Wrap selection with markers
+            self.buffer.insert_lines_at(e, &[marker_chars.clone()]);
+            self.buffer.insert_lines_at(s, &[marker_chars.clone()]);
+            if s.0 == e.0 {
+                self.mark_start = Some((s.0, s.1 + m_len));
+                self.mark_end = Some((e.0, e.1 + m_len));
+                if self.cur_line == s.0 && self.cur_col >= s.1 {
+                    self.cur_col += m_len;
+                }
+            } else {
+                self.mark_start = Some((s.0, s.1 + m_len));
+                self.mark_end = Some((e.0, e.1));
+                if self.cur_line == s.0 && self.cur_col >= s.1 {
+                    self.cur_col += m_len;
+                }
+            }
+            self.clamp_cursor();
+            return;
+        }
+
+        // Case 2: No active selection
+        let line = &self.buffer.lines[self.cur_line];
+        if let Some(span) = decoration::find_enclosing_decoration_span(line, self.cur_col, kind, syntax) {
+            self.buffer.delete_range((self.cur_line, span.close_start), (self.cur_line, span.close_end));
+            self.buffer.delete_range((self.cur_line, span.open_start), (self.cur_line, span.open_end));
+
+            let open_len = span.open_end - span.open_start;
+            let close_len = span.close_end - span.close_start;
+            if self.cur_col <= span.open_start {
+                // Before open marker: unchanged
+            } else if self.cur_col <= span.open_end {
+                self.cur_col = span.open_start;
+            } else if self.cur_col <= span.close_start {
+                self.cur_col -= open_len;
+            } else if self.cur_col <= span.close_end {
+                self.cur_col = span.close_start - open_len;
+            } else {
+                self.cur_col -= open_len + close_len;
+            }
+            self.clamp_cursor();
+            return;
+        }
+
+        let pair: Vec<char> = format!("{}{}", marker, marker).chars().collect();
+        self.buffer.insert_lines_at((self.cur_line, self.cur_col), &[pair]);
+        self.cur_col += m_len;
+        self.clamp_cursor();
+    }
+
+    pub fn toggle_decoration_display(&mut self) {
+        self.config.display.decoration = !self.config.display.decoration;
+        if self.config.display.decoration {
+            self.message = "Decoration ON".to_string();
+        } else {
+            self.message = "Decoration OFF".to_string();
+        }
+        let _ = self.config.save();
     }
 
     // ---- search / replace -----------------------------------------------
@@ -1068,5 +1210,137 @@ mod tests {
         ed.handle_key(plain('y'));
         ed.handle_key(key(KeyCode::Enter));
         assert!(ed.quit);
+    }
+
+    #[test]
+    fn toggle_bold_inserts_pair_and_removes_on_repeat() {
+        let mut ed = new_editor();
+        // Press ^P B
+        ed.handle_key(ctrl('p'));
+        ed.handle_key(plain('b'));
+        assert_eq!(text(&ed), "****");
+        assert_eq!((ed.cur_line, ed.cur_col), (0, 2));
+
+        // Press ^P B again -> removes the empty pair
+        ed.handle_key(ctrl('p'));
+        ed.handle_key(plain('b'));
+        assert_eq!(text(&ed), "");
+        assert_eq!((ed.cur_line, ed.cur_col), (0, 0));
+    }
+
+    #[test]
+    fn toggle_italic_inserts_pair_and_removes_on_repeat() {
+        let mut ed = new_editor();
+        // Press ^P Y
+        ed.handle_key(ctrl('p'));
+        ed.handle_key(plain('y'));
+        assert_eq!(text(&ed), "**");
+        assert_eq!((ed.cur_line, ed.cur_col), (0, 1));
+
+        // Press ^P Y again -> removes the empty pair
+        ed.handle_key(ctrl('p'));
+        ed.handle_key(plain('y'));
+        assert_eq!(text(&ed), "");
+        assert_eq!((ed.cur_line, ed.cur_col), (0, 0));
+    }
+
+    #[test]
+    fn toggle_bold_inside_word_removes_markers() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "hello **world** foo");
+        ed.cur_col = 10; // inside "world"
+        ed.handle_key(ctrl('p'));
+        ed.handle_key(plain('b'));
+        assert_eq!(text(&ed), "hello world foo");
+        assert_eq!((ed.cur_line, ed.cur_col), (0, 8));
+    }
+
+    #[test]
+    fn toggle_italic_inside_word_removes_markers() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "hello *world* foo");
+        ed.cur_col = 9; // inside "world"
+        ed.handle_key(ctrl('p'));
+        ed.handle_key(plain('y'));
+        assert_eq!(text(&ed), "hello world foo");
+        assert_eq!((ed.cur_line, ed.cur_col), (0, 8));
+    }
+
+    #[test]
+    fn toggle_bold_with_selection_wraps_and_unwraps() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "hello world");
+        ed.cur_col = 6;
+        ed.handle_key(ctrl('k'));
+        ed.handle_key(plain('b')); // mark start at 6
+        ed.cur_col = 11;
+        ed.handle_key(ctrl('k'));
+        ed.handle_key(plain('k')); // mark end at 11
+
+        // Wrap with bold: ^P B
+        ed.handle_key(ctrl('p'));
+        ed.handle_key(plain('b'));
+        assert_eq!(text(&ed), "hello **world**");
+
+        // Repeat ^P B on wrapped selection -> unwraps
+        ed.handle_key(ctrl('p'));
+        ed.handle_key(plain('b'));
+        assert_eq!(text(&ed), "hello world");
+    }
+
+    #[test]
+    fn toggle_bold_selection_including_markers_unwraps() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "hello **world**");
+        ed.cur_col = 6;
+        ed.handle_key(ctrl('k'));
+        ed.handle_key(plain('b')); // mark start at 6
+        ed.cur_col = 15;
+        ed.handle_key(ctrl('k'));
+        ed.handle_key(plain('k')); // mark end at 15 (includes **)
+
+        ed.handle_key(ctrl('p'));
+        ed.handle_key(plain('b'));
+        assert_eq!(text(&ed), "hello world");
+    }
+
+    #[test]
+    fn toggle_italic_with_selection_wraps_and_unwraps() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "hello world");
+        ed.cur_col = 6;
+        ed.handle_key(ctrl('k'));
+        ed.handle_key(plain('b'));
+        ed.cur_col = 11;
+        ed.handle_key(ctrl('k'));
+        ed.handle_key(plain('k'));
+
+        // Wrap with italic: ^P Y
+        ed.handle_key(ctrl('p'));
+        ed.handle_key(plain('y'));
+        assert_eq!(text(&ed), "hello *world*");
+
+        // Repeat ^P Y on wrapped selection -> unwraps
+        ed.handle_key(ctrl('p'));
+        ed.handle_key(plain('y'));
+        assert_eq!(text(&ed), "hello world");
+    }
+
+    #[test]
+    fn toggle_decoration_display_via_key() {
+        let mut ed = new_editor();
+        assert!(ed.config.display.decoration);
+
+        // ^O D toggles decoration display OFF
+        ed.handle_key(ctrl('o'));
+        ed.handle_key(plain('d'));
+        assert!(!ed.config.display.decoration);
+        assert_eq!(ed.message, "Decoration OFF");
+
+        // ^O D toggles decoration display ON
+        ed.handle_key(ctrl('o'));
+        ed.handle_key(plain('d'));
+        assert!(ed.config.display.decoration);
+        assert_eq!(ed.message, "Decoration ON");
     }
 }

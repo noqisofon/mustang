@@ -55,12 +55,16 @@ pub enum Command {
     ToggleMenu,
     Help,
 
+    ToggleBold,
+    ToggleItalic,
+    ToggleDecorationDisplay,
+
     CancelPrefix,
     Beep,
     None,
 }
 
-/// Tracks whether we're mid-way through a WordStar two-key ^K / ^Q / ^O
+/// Tracks whether we're mid-way through a WordStar two-key ^K / ^Q / ^O / ^P
 /// prefix sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrefixState {
@@ -69,6 +73,7 @@ pub enum PrefixState {
     K,
     Q,
     O,
+    P,
 }
 
 
@@ -130,6 +135,19 @@ pub fn translate(ev: KeyEvent, prefix: &mut PrefixState) -> Command {
                 KeyCode::Esc => Command::CancelPrefix,
                 KeyCode::Char(c) => match c.to_ascii_uppercase() {
                     'H' => Command::ToggleMenu,
+                    'D' => Command::ToggleDecorationDisplay,
+                    _ => Command::Beep,
+                },
+                _ => Command::Beep,
+            };
+        }
+        PrefixState::P => {
+            *prefix = PrefixState::None;
+            return match ev.code {
+                KeyCode::Esc => Command::CancelPrefix,
+                KeyCode::Char(c) => match c.to_ascii_uppercase() {
+                    'B' => Command::ToggleBold,
+                    'Y' => Command::ToggleItalic,
                     _ => Command::Beep,
                 },
                 _ => Command::Beep,
@@ -151,6 +169,10 @@ pub fn translate(ev: KeyEvent, prefix: &mut PrefixState) -> Command {
                 }
                 'o' => {
                     *prefix = PrefixState::O;
+                    return Command::None;
+                }
+                'p' => {
+                    *prefix = PrefixState::P;
                     return Command::None;
                 }
                 'e' => return Command::MoveUp,
